@@ -1,0 +1,190 @@
+$ErrorActionPreference='Stop'
+$repo=Split-Path $PSScriptRoot -Parent
+. (Join-Path $repo 'AntigravityHub.ps1') -Preview -NoShow
+function Assert($Value,$Name){if(-not $Value){throw $Name};Write-Host "PASS: $Name"}
+function Layout([int]$Width=1220,[int]$Height=800){
+    Update-HubLayout $Height
+    $window.Content.Measure([Windows.Size]::new($Width,$Height))
+    $window.Content.Arrange([Windows.Rect]::new(0,0,$Width,$Height))
+    $window.Content.UpdateLayout()
+    $window.Dispatcher.Invoke([Action]{},[Windows.Threading.DispatcherPriority]::ApplicationIdle)
+    $window.Content.UpdateLayout()
+}
+$fixture=Join-Path $repo ('work\dashboard-test-'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+try {
+    Assert ($window.FindName('StatTotal').Text -eq '6' -and $window.FindName('StatReady').Text -eq '4' -and $window.FindName('StatAttention').Text -eq '2') 'Dashboard totals cover the entire account pool'
+    Assert ($accountsContainer.Items[0].IsActive -and $accountsContainer.Items.Count -eq 6) 'Verified active identity is pinned first'
+    Assert ($accountsContainer.Items[0].ArgonText -eq '64%' -and $accountsContainer.Items[0].ArgonValue -eq 64) 'Dashboard projects Gemini 4 Argon quota percentage'
+    $unknown=$script:HubAccounts | Where-Object StateKey -eq Unknown
+    Assert ($unknown.FiveText -eq 'N/A' -and $unknown.ArgonText -eq 'N/A' -and -not $unknown.CanSwitch) 'Unknown quota stays unavailable, never displayed as exhausted'
+    $argonLow=ConvertTo-HubAccount ([pscustomobject]@{AccountName='argon.low';Email='argon.low@example.test';Success=$true;Gemini5H=.95;GeminiWeekly=.90;ArgonWeekly=.05;TokenPath='';VerificationUrl=$null;ErrorCode=''}) ''
+    Assert ($argonLow.StateKey -eq 'Low' -and $argonLow.ArgonText -eq '5%' -and -not $argonLow.CanSwitch) 'Low Gemini 4 Argon quota marks account as needing attention and blocks manual switch'
+    $argonDisabled=ConvertTo-HubAccount ([pscustomobject]@{AccountName='argon.disabled';Success=$true;Gemini5H=.9;GeminiWeekly=.9;ArgonWeekly=-1;ArgonStatus='Disabled'}) ''
+    Assert ($argonDisabled.ArgonText -eq (Get-HubText ArgonDisabled) -and $argonDisabled.ArgonBarVisibility -eq 'Hidden' -and $argonDisabled.ArgonHint -eq (Get-HubText ArgonDisabledHint)) 'Disabled Argon has an explicit label and explanation instead of a zero quota bar'
+    $planRow=ConvertTo-HubAccount ([pscustomobject]@{Plan='Pro';PlanSource='PaidTier';Success=$false}) ''
+    Assert ($planRow.PlanText -eq 'Pro' -and $planRow.PlanHint -eq (Get-HubText PlanPaidHint)) 'Known plan is displayed independently of quota availability'
+    Assert ($unknown.PlanText -eq (Get-HubText PlanUnknown)) 'Missing plan is never displayed as Free'
+    Assert (@($accountsContainer.Columns | Where-Object SortMemberPath -eq 'PlanText').Count -eq 1) 'Account table exposes a sortable plan column'
+    Assert ($unknown.FiveRing.Value -eq -1 -and $unknown.CarbonRing.Dash -eq '2,2') 'Unavailable model uses an empty dashed ring, not zero percent'
+    $emptyRing=New-HubQuotaRing -1 'fixture' 'Unknown'
+    $zeroRing=New-HubQuotaRing 0 'fixture' 'Available'
+    $fullRing=New-HubQuotaRing 1 'fixture' 'Available'
+    Assert ($zeroRing.Text -eq '0%' -and $emptyRing.Text -ne '0%' -and $fullRing.Text -eq '100%') 'Rings distinguish unknown, exhausted and full quota'
+    Assert ($fullRing.Geometry -match '24,44' -and $zeroRing.Geometry -eq 'M 24,4') 'Full quota draws a complete circle while zero draws no arc'
+    $previousCulture=[Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [Threading.Thread]::CurrentThread.CurrentCulture=[Globalization.CultureInfo]::GetCultureInfo('de-DE')
+        $geometry=(New-HubQuotaRing .123 'fixture' 'Available').Geometry
+        Assert ($null -ne [Windows.Media.Geometry]::Parse($geometry)) 'Ring geometry remains valid under comma-decimal locales'
+    } finally {[Threading.Thread]::CurrentThread.CurrentCulture=$previousCulture}
+    $modelAccount=[pscustomobject]@{ModelQuotas=@(
+        [pscustomobject]@{Name='Opus High';Family='Opus';Status='Available';Remaining=.7;ResetAt=''}
+        [pscustomobject]@{Name='Opus Medium';Family='Opus';Status='Available';Remaining=.8;ResetAt=''}
+        [pscustomobject]@{Name='Opus Disabled';Family='Opus';Status='Disabled';Remaining=-1;ResetAt=''}
+    );Success=$false}
+    $ring=Get-HubModelRing $modelAccount 'Opus'
+    Assert ($ring.Value -eq 70 -and $ring.Hint -match 'Opus High' -and $ring.Hint -match 'Opus Medium') 'Family ring uses minimum enabled variant and preserves all variants in tooltip'
+    Assert ((ConvertTo-HubAccount $modelAccount '').OpusRing.Value -eq 70) 'Valid model quota is visible even if Gemini summary fails'
+    $modelAccount.ModelQuotas[1].Status='Unknown'
+    Assert ((Get-HubModelRing $modelAccount 'Opus').Value -eq -1) 'Incomplete family never invents a complete quota percentage'
+    Assert ($window.FindName('RefreshInterval').SelectedItem.Tag -eq '30') 'Background model monitoring defaults to thirty seconds after completion'
+    $selectedFixture=[pscustomobject]@{Email='target@example.test';Success=$true;ModelsStatus='Available';Gemini5H=0;GeminiWeekly=0;ArgonWeekly=0;ModelQuotas=@([pscustomobject]@{Name='Claude Sonnet 5.5 (Medium)';Family='Sonnet';Status='Available';Remaining=.9});QuotaGroups=@([pscustomobject]@{Name='Claude and GPT models';Remaining=.8})}
+    $selectedRow=ConvertTo-HubAccount $selectedFixture '' 'Claude Sonnet 5.5 Medium'
+    Assert ($selectedRow.CanSwitch -and $selectedRow.StateKey -eq 'Ready' -and $selectedRow.FiveText -eq '0%') 'Manual button follows selected-model quota without hiding other exhausted quotas'
+    $selectedFixture.ModelQuotas[0].Status='Disabled'
+    $selectedRow=ConvertTo-HubAccount $selectedFixture '' 'Claude Sonnet 5.5 Medium'
+    Assert (-not $selectedRow.CanSwitch -and $selectedRow.StateKey -eq 'Unknown') 'Missing selected model access disables manual target action without inventing quota'
+    $quotaColumns=@($accountsContainer.Columns|Where-Object SortMemberPath -match 'Ring.Value'|ForEach-Object {$_.SortMemberPath})
+    Assert (($quotaColumns -join ',') -eq 'FiveRing.Value,WeekRing.Value,FlashRing.Value,NeonRing.Value,ArgonRing.Value,HydrogenRing.Value,CarbonRing.Value,OpusRing.Value,SonnetRing.Value,GptOssRing.Value') 'Neon is displayed alongside the other Gemini models'
+    Assert ($accountsContainer.Items[0].NeonRing.Value -eq 76 -and $unknown.NeonRing.Dash -eq '2,2') 'Neon displays reported quota and a dashed ring when missing'
+    Assert ($selectedRow.QuotaDetails.Contains("Orchestrator (Neon): $(Get-HubText ModelUnknown)")) 'Details show missing Orchestrator quota without copying the planner quota'
+    $window.FindName('FilterReady').IsChecked=$true
+    Assert ($accountsContainer.Items.Count -eq 4 -and $window.FindName('StatTotal').Text -eq '6') 'Ready filter does not alter pool totals'
+    $window.FindName('SearchAccounts').Text='PRODUCT'
+    Assert ($accountsContainer.Items.Count -eq 1 -and $accountsContainer.Items[0].AccountName -eq 'product.lab') 'Search matches account names without case sensitivity'
+    $window.FindName('SearchAccounts').Text='['
+    Assert ($accountsContainer.Items.Count -eq 0 -and $window.FindName('EmptyAccounts').Visibility -eq 'Visible') 'Search treats metacharacters literally and shows a no-results state'
+    $window.FindName('SearchAccounts').Text=''
+    $window.FindName('FilterAttention').IsChecked=$true
+    Assert ($accountsContainer.Items.Count -eq 2) 'Attention filter includes low and unavailable quota'
+    $window.FindName('FilterAll').IsChecked=$true
+    $accountsContainer.Items.SortDescriptions.Add([ComponentModel.SortDescription]::new('FiveValue',[ComponentModel.ListSortDirection]::Descending))
+    Update-HubAccountView
+    Assert ($accountsContainer.Items.SortDescriptions.Count -eq 1 -and $accountsContainer.Items[0].FiveValue -eq 98) 'Column sorting survives data refresh'
+    $window.FindName('NavHistory').IsChecked=$true
+    Assert ($window.FindName('HistoryPage').Visibility -eq 'Visible' -and $window.FindName('AccountsPage').Visibility -eq 'Collapsed') 'History navigation opens the event table'
+    Assert ($window.FindName('HistoryGrid').Items.Count -eq 4 -and $window.FindName('StatRotations').Text -eq '2') 'Rotation counter counts only verified events'
+    $events=@(ConvertFrom-HubLog @('[2026-10-13 01:02:03] Switch deferred: https://private.invalid/?access_token=SECRET_SENTINEL','[invalid] Verified IDE account: [bad].','[2026-10-13 01:02:04] unknown SECRET_SENTINEL','[2026-10-13 01:02:05] Account [fixture] prepared for next IDE launch (not yet verified).'))
+    Assert ($events.Count -eq 2 -and ($events | ConvertTo-Json) -notmatch 'SECRET_SENTINEL|private.invalid') 'History skips unknown messages and never displays raw provider details'
+    $window.FindName('NavAccounts').IsChecked=$true
+    Layout
+    function Find-Buttons($Parent){
+        for($i=0;$i -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($Parent);$i++){
+            $child=[Windows.Media.VisualTreeHelper]::GetChild($Parent,$i)
+            if($child -is [Windows.Controls.Button] -and $child.Tag){$child}
+            Find-Buttons $child
+        }
+    }
+    $buttons=@(Find-Buttons $accountsContainer)
+    $script:CapturedAction=$null
+    function Invoke-HubAccountAction {param($Action,$Account) $script:CapturedAction=@($Action,$Account.AccountName)}
+    $button=$buttons | Where-Object {$_.Tag -eq 'Switch' -and $_.IsEnabled} | Select-Object -First 1
+    Assert ([bool]$button) 'Account actions are rendered as native buttons'
+    $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent,$button))
+    Assert ($script:CapturedAction[0] -eq 'Switch' -and $script:CapturedAction[1] -eq $button.DataContext.AccountName) 'Routed account action targets the clicked row'
+    Layout 1040 640
+    $refresh=$window.FindName('BtnRefresh')
+    $search=$window.FindName('SearchAccounts')
+    $point=$refresh.TranslatePoint([Windows.Point]::new(0,0),$window.Content)
+    Assert ($point.X+$refresh.ActualWidth -le 1040 -and $point.Y+$refresh.ActualHeight -le 640 -and $search.ActualWidth -ge 200) 'Compact desktop layout keeps the search and refresh controls reachable'
+    $last=$accountsContainer.Items[$accountsContainer.Items.Count-1]
+    $accountsContainer.ScrollIntoView($last)
+    Layout 1040 640
+    Assert ($null -ne $accountsContainer.ItemContainerGenerator.ContainerFromItem($last)) 'Virtualized account list can scroll to the last account'
+    $verify=ConvertTo-HubAccount ([pscustomobject]@{AccountName='verify';Email='verify@example.test';Success=$false;ErrorCode='AccountVerificationRequired';VerificationUrl='https://accounts.google.com/signin/continue?fixture=1'}) ''
+    Assert ($verify.VerifyVisibility -eq 'Visible' -and $verify.SwitchVisibility -eq 'Collapsed' -and -not $verify.CanSwitch) 'Verification-required account offers verification instead of switching'
+
+    # Exercise the real background runspace pipeline with an isolated engine fixture.
+    Copy-Item (Join-Path $repo 'Dashboard.ps1'),(Join-Path $repo 'DashboardText.vi.json'),(Join-Path $repo 'SafeUpdater.ps1') -Destination $fixture
+    @'
+function Get-AllAccountsQuota { Start-Sleep -Milliseconds 600; [pscustomobject]@{AccountName='worker.fixture';Email='worker@example.test';Success=$true;Gemini5H=.8;GeminiWeekly=.9;ArgonWeekly=.75;TokenPath='';VerificationUrl=$null;ErrorCode=''} }
+function Get-RuntimeIdentity { [pscustomobject]@{Email='worker@example.test';Idle=$true} }
+function Read-RotationState { $null }
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction) }
+function Repair-RotationState { $true }
+'@ | Set-Content -LiteralPath (Join-Path $fixture 'AutoRotator.ps1') -Encoding ASCII
+    $Preview=$false;$baseDir=$fixture;$logFile=Join-Path $fixture 'rotator.log'
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    Load-Accounts-UI
+    Assert ($clock.ElapsedMilliseconds -lt 500 -and -not $btnRefresh.IsEnabled) 'Quota refresh starts asynchronously and disables repeat requests'
+    Load-Accounts-UI -Reconcile
+    Assert ($script:HubRefreshQueued -and $script:HubRepairQueued) 'Refresh requested during a scan is queued, not lost'
+    $deadline=(Get-Date).AddSeconds(15)
+    while($script:HubWorker -and (Get-Date) -lt $deadline){Start-Sleep -Milliseconds 50;Complete-HubRefresh}
+    Assert (-not $script:HubWorker -and $accountsContainer.Items.Count -eq 1 -and $accountsContainer.Items[0].AccountName -eq 'worker.fixture' -and $accountsContainer.Items[0].ArgonText -eq '75%' -and $btnRefresh.IsEnabled) 'Background result updates the dashboard and releases its worker'
+    'function Get-AllAccountsQuota { throw "fixture failure" }' | Set-Content -LiteralPath (Join-Path $fixture 'AutoRotator.ps1') -Encoding ASCII
+    Load-Accounts-UI
+    $deadline=(Get-Date).AddSeconds(10)
+    while($script:HubWorker -and (Get-Date) -lt $deadline){Start-Sleep -Milliseconds 50;Complete-HubRefresh}
+    Assert ($window.FindName('TxtUpdated').Text -eq (Get-HubText ScanError) -and $accountsContainer.Items.Count -eq 1 -and $btnRefresh.IsEnabled) 'Failed scan preserves previous data and shows a stale-data message'
+    '[2026-10-13 10:00:00] Verified IDE account: [fixture].' | Set-Content -LiteralPath $logFile -Encoding UTF8
+    Update-HubHistory -Force
+    Assert ($window.FindName('HistoryGrid').Items.Count -eq 1 -and $window.FindName('StatRotations').Text -eq '1') 'History reads real log events without quota network calls'
+    Remove-Item -LiteralPath $logFile
+    Update-HubHistory -Force
+    Assert ($window.FindName('HistoryGrid').Items.Count -eq 0 -and $window.FindName('EmptyHistory').Visibility -eq 'Visible') 'Missing log displays a valid empty history'
+    $script:HubAccounts=@();Update-HubAccountView
+    Assert ($window.FindName('EmptyAccounts').Visibility -eq 'Visible' -and $window.FindName('EmptyTitle').Text -eq (Get-HubText NoAccounts)) 'Empty account pool explains how to get started'
+
+    # Verify PauseScanWhenIdeClosed setting toggle, dynamic MinQuotaPercent, delete path containment, and hardened updater UI.
+    $chkPause = $window.FindName('ChkPauseWhenIdeClosed')
+    Assert ($null -ne $chkPause -and [bool]$chkPause.IsChecked) 'PauseScanWhenIdeClosed checkbox exists and defaults to checked'
+    Assert ($null -ne $window.FindName('BtnViewUpdateDiff') -and $null -ne $window.FindName('TxtCurrentVersion')) 'Hardened release updater controls exist in Settings'
+    Assert (([IO.File]::ReadAllText((Join-Path $repo 'MainWindow.xaml'))) -notmatch 'github\.com/') 'MainWindow.xaml contains no hardcoded external repository URLs'
+
+    $script:TestConfig = [pscustomobject]@{AutoRotationEnabled=$true;PauseScanWhenIdeClosed=$false;CliRotationEnabled=$true;MinQuotaPercent=30;CooldownSeconds=120;EnableNotifications=$true;Theme='Light'}
+    function Get-HubConfig { $script:TestConfig }
+    $script:SavedConfig = $null
+    function Save-HubConfig { param($Config) $script:SavedConfig = $Config }
+    Update-HubSettingsUi
+    Assert (-not [bool]$chkPause.IsChecked) 'Update-HubSettingsUi binds PauseScanWhenIdeClosed=false from config'
+    $chkPause.IsChecked = $true
+    $window.FindName('BtnSaveSettings').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent, $window.FindName('BtnSaveSettings')))
+    $deadline=(Get-Date).AddSeconds(10)
+    while($script:HubWorker -and (Get-Date) -lt $deadline){Start-Sleep -Milliseconds 50;Complete-HubRefresh}
+    Assert ($null -ne $script:SavedConfig -and [bool]$script:SavedConfig.PauseScanWhenIdeClosed) 'Saving settings persists PauseScanWhenIdeClosed toggle'
+
+    # Dynamic MinQuotaPercent replaces hardcoded 20% threshold drift
+    $midAcc = [pscustomobject]@{AccountName='mid.quota';Email='mid@example.test';Success=$true;Gemini5H=.25;GeminiWeekly=.90;ArgonWeekly=.25;TokenPath='';VerificationUrl=$null;ErrorCode=''}
+    $script:TestConfig.MinQuotaPercent = 30
+    $row30 = ConvertTo-HubAccount $midAcc ''
+    Assert ($row30.StateKey -eq 'Low' -and -not $row30.CanSwitch -and $row30.FiveColor -eq '#F2C97D' -and $row30.ArgonColor -eq '#93B9EE') '25% quota is Low and blocks switch when MinQuotaPercent is 30%'
+    $script:TestConfig.MinQuotaPercent = 10
+    $row10 = ConvertTo-HubAccount $midAcc ''
+    Assert ($row10.StateKey -eq 'Ready' -and $row10.CanSwitch -and $row10.FiveColor -eq '#7EE2B8' -and $row10.ArgonColor -eq '#7EE2B8') '25% quota is Ready and allows switch when MinQuotaPercent is 10%'
+
+    # Account delete path containment guard
+    $accTestDir = Join-Path $fixture 'accounts'
+    New-Item -ItemType Directory -Path $accTestDir -Force | Out-Null
+    $validAccPath = Join-Path $accTestDir 'alice.json'
+    [IO.File]::WriteAllText($validAccPath, '{}')
+    $outsidePath = Join-Path $fixture 'outside.json'
+    [IO.File]::WriteAllText($outsidePath, '{}')
+    Assert (Test-HubAccountDeletePath $validAccPath $accTestDir) 'Delete path guard accepts direct JSON inside accounts directory'
+    Assert (-not (Test-HubAccountDeletePath (Join-Path $accTestDir '..\outside.json') $accTestDir)) 'Delete path guard rejects parent traversal'
+    Assert (-not (Test-HubAccountDeletePath $outsidePath $accTestDir)) 'Delete path guard rejects file outside accounts directory'
+    Assert (-not (Test-HubAccountDeletePath (Join-Path $accTestDir 'alice.txt') $accTestDir)) 'Delete path guard rejects non-JSON extension'
+    Assert (-not (Test-HubAccountDeletePath (Join-Path $accTestDir 'sub\alice.json') $accTestDir)) 'Delete path guard rejects nested subdirectory path'
+    Assert (-not (Test-HubAccountDeletePath $accTestDir $accTestDir)) 'Delete path guard rejects directory itself'
+
+    # Preview mode guard on updater buttons
+    $Preview = $true
+    $window.FindName('TxtUpdateStatus').Text = ''
+    $window.FindName('BtnCheckUpdate').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent, $window.FindName('BtnCheckUpdate')))
+    Assert ($window.FindName('TxtUpdateStatus').Text -eq '') 'Preview mode guards BtnCheckUpdate from running update checks'
+} finally {
+    $window.Close()
+    $resolved=[IO.Path]::GetFullPath($fixture)
+    if($resolved.StartsWith([IO.Path]::GetFullPath((Join-Path $repo 'work'))+'\',[StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($resolved) -match '^dashboard-test-[a-f0-9]{32}$') {Remove-Item -LiteralPath $resolved -Recurse -Force}
+}

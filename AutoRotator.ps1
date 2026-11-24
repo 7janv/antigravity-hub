@@ -1,0 +1,292 @@
+# ==============================================================================
+# ANTIGRAVITY AUTO-ROTATOR ENGINE (SELECTED MODEL BELOW 20%, IDLE ONLY)
+# ==============================================================================
+param (
+    [switch]$RunOnce,
+    [switch]$Daemon,
+    [switch]$Reconcile,
+    [ValidateRange(10,3600)][int]$IntervalSeconds = 30,
+    [ValidateRange(0,0.95)][double]$MinQuotaThreshold = 0.20,
+    [ValidateRange(0,0.95)][double]$MinWeeklyThreshold = 0.08,
+    [ValidateRange(0,0.95)][double]$MinArgonThreshold = 0.08
+)
+
+$baseDir = $PSScriptRoot
+if (-not $baseDir) { $baseDir = (Get-Location).Path }
+$accDir = Join-Path $baseDir "accounts"
+$activeFile = Join-Path $baseDir "current_active.txt"
+$logFile = Join-Path $baseDir "rotator.log"
+$geminiTokenPath = Join-Path $env:USERPROFILE ".gemini\jetski-standalone-oauth-token"
+
+if (-not (Test-Path $accDir)) {
+    New-Item -ItemType Directory -Path $accDir -Force | Out-Null
+}
+
+if (-not ("WinCred" -as [type])) {
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class WinCred {
+    [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CredWrite([In] ref CREDENTIAL userCredential, [In] uint flags);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CredDelete(string target, int type, int flags);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredFree", SetLastError = true)]
+    public static extern void CredFree(IntPtr buffer);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public int Flags;
+        public int Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public int CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public int Persist;
+        public int AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+
+    public static string Read(string target) {
+        if (string.IsNullOrEmpty(target)) return null;
+        IntPtr credPtr;
+        if (CredRead(target, 1, 0, out credPtr)) {
+            CREDENTIAL cred = new CREDENTIAL();
+            bool parsed = false;
+            try {
+                if (credPtr == IntPtr.Zero) return null;
+                cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
+                parsed = true;
+                if (cred.CredentialBlob == IntPtr.Zero || cred.CredentialBlobSize <= 0) {
+                    return string.Empty;
+                }
+                byte[] b = new byte[cred.CredentialBlobSize];
+                Marshal.Copy(cred.CredentialBlob, b, 0, cred.CredentialBlobSize);
+                try {
+                    return Encoding.UTF8.GetString(b);
+                } finally {
+                    Array.Clear(b, 0, b.Length);
+                }
+            } finally {
+                if (parsed && cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0) {
+                    try {
+                        byte[] zeros = new byte[cred.CredentialBlobSize];
+                        Marshal.Copy(zeros, 0, cred.CredentialBlob, cred.CredentialBlobSize);
+                    } catch { }
+                }
+                if (credPtr != IntPtr.Zero) {
+                    CredFree(credPtr);
+                }
+            }
+        }
+        return null;
+    }
+
+    public static bool Write(string target, string userName, string secret) {
+        if (string.IsNullOrEmpty(target) || secret == null) return false;
+        byte[] b = Encoding.UTF8.GetBytes(secret);
+        IntPtr ptr = IntPtr.Zero;
+        if (b.Length > 0) {
+            ptr = Marshal.AllocHGlobal(b.Length);
+            Marshal.Copy(b, 0, ptr, b.Length);
+        }
+
+        CREDENTIAL cred = new CREDENTIAL();
+        cred.Type = 1;
+        cred.TargetName = target;
+        cred.UserName = userName;
+        cred.CredentialBlob = ptr;
+        cred.CredentialBlobSize = b.Length;
+        cred.Persist = 2;
+
+        try {
+            return CredWrite(ref cred, 0);
+        } finally {
+            if (ptr != IntPtr.Zero) {
+                byte[] zeros = new byte[b.Length];
+                Marshal.Copy(zeros, 0, ptr, b.Length);
+                Marshal.FreeHGlobal(ptr);
+            }
+            Array.Clear(b, 0, b.Length);
+        }
+    }
+
+    public static bool Delete(string target) {
+        return CredDelete(target, 1, 0);
+    }
+}
+"@
+}
+
+$script:MaxLogBytes = 2097152
+$script:MaxLogLines = 2500
+
+function Write-RotatorLog {
+    param ([string]$msg)
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $entry = "[$ts] $msg"
+    Write-Host $entry
+    try {
+        Add-Content -LiteralPath $logFile -Value $entry -Encoding UTF8 -ErrorAction SilentlyContinue
+        $maxBytes = if ($script:MaxLogBytes -gt 0) { [int64]$script:MaxLogBytes } else { 2097152 }
+        $maxLines = if ($script:MaxLogLines -gt 0) { [int]$script:MaxLogLines } else { 2500 }
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -gt $maxBytes) {
+            $tail = @(Get-Content -LiteralPath $logFile -Tail $maxLines -Encoding UTF8 -ErrorAction Stop)
+            $tmpLog = "$logFile.$([guid]::NewGuid().ToString('N')).tmp"
+            try {
+                [IO.File]::WriteAllLines($tmpLog, [string[]]$tail, [Text.UTF8Encoding]::new($false))
+                [IO.File]::Replace($tmpLog, $logFile, [NullString]::Value)
+            } finally {
+                if ([IO.File]::Exists($tmpLog)) { [IO.File]::Delete($tmpLog) }
+            }
+        }
+    } catch {}
+}
+
+function Get-HubConfig {
+    $cfg = [pscustomobject]@{
+        AutoRotationEnabled = $true
+        CliRotationEnabled = $true
+        PauseScanWhenIdeClosed = $true
+        MinQuotaPercent = 20
+        CooldownSeconds = 120
+        EnableNotifications = $true
+        Theme = 'Light'
+    }
+    $path = Join-Path $baseDir 'hub-config.json'
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $raw.AutoRotationEnabled) { $cfg.AutoRotationEnabled = [bool]$raw.AutoRotationEnabled }
+            if ($null -ne $raw.CliRotationEnabled) { $cfg.CliRotationEnabled = [bool]$raw.CliRotationEnabled }
+            if ($null -ne $raw.PauseScanWhenIdeClosed) { $cfg.PauseScanWhenIdeClosed = [bool]$raw.PauseScanWhenIdeClosed }
+            if ($null -ne $raw.MinQuotaPercent -and [int]$raw.MinQuotaPercent -ge 5 -and [int]$raw.MinQuotaPercent -le 50) { $cfg.MinQuotaPercent = [int]$raw.MinQuotaPercent }
+            if ($null -ne $raw.CooldownSeconds -and [int]$raw.CooldownSeconds -ge 30 -and [int]$raw.CooldownSeconds -le 600) { $cfg.CooldownSeconds = [int]$raw.CooldownSeconds }
+            if ($null -ne $raw.EnableNotifications) { $cfg.EnableNotifications = [bool]$raw.EnableNotifications }
+            if ($raw.Theme -in @('Light','Amoled')) { $cfg.Theme = [string]$raw.Theme }
+        } catch {}
+    }
+    return $cfg
+}
+
+function Save-HubConfig {
+    param($Config)
+    $path = Join-Path $baseDir 'hub-config.json'
+    $json = $Config | ConvertTo-Json -Compress
+    $temp = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $json, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) { [IO.File]::Replace($temp, $path, [NullString]::Value) }
+        else { [IO.File]::Move($temp, $path) }
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Send-ToastNotification {
+    param (
+        [string]$Title = "Antigravity Auto-Hub",
+        [string]$Message = ""
+    )
+    if (-not (Get-HubConfig).EnableNotifications) { return }
+    try {
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+
+        $safeTitle = [System.Security.SecurityElement]::Escape($Title)
+        $safeMsg = [System.Security.SecurityElement]::Escape($Message)
+
+        $template = @"
+<toast duration="short">
+    <visual>
+        <binding template="ToastGeneric">
+            <text>$safeTitle</text>
+            <text>$safeMsg</text>
+        </binding>
+    </visual>
+</toast>
+"@
+        $xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xmlDoc.LoadXml($template)
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $xmlDoc
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe")
+        $notifier.Show($toast)
+    } catch {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $notify = New-Object System.Windows.Forms.NotifyIcon
+            try {
+                $notify.Icon = [System.Drawing.SystemIcons]::Information
+                $notify.BalloonTipTitle = $Title
+                $notify.BalloonTipText = $Message
+                $notify.Visible = $true
+                $notify.ShowBalloonTip(3000)
+                Start-Sleep -Milliseconds 3200
+            } finally {
+                try { $notify.Visible = $false } catch {}
+                try { $notify.Dispose() } catch {}
+            }
+        } catch {}
+    }
+}
+
+$stateFile = Join-Path $baseDir 'rotation-state.json'
+$script:GoogleClientId = $env:ANTIGRAVITY_GOOGLE_CLIENT_ID
+$script:GoogleClientSecret = $env:ANTIGRAVITY_GOOGLE_CLIENT_SECRET
+if (-not $script:GoogleClientId -or -not $script:GoogleClientSecret) {
+    $localConfig = Join-Path $baseDir 'oauth.local.clixml'
+    if (Test-Path -LiteralPath $localConfig) {
+        try {
+            $config = Import-Clixml -LiteralPath $localConfig -ErrorAction Stop
+            if ($config -is [pscredential]) {
+                $script:GoogleClientId = $config.UserName
+                $script:GoogleClientSecret = $config.GetNetworkCredential().Password
+            } else {
+                Write-Warning 'Local OAuth configuration has an unexpected type.'
+            }
+        } catch { Write-Warning 'Local OAuth configuration cannot be decrypted by this Windows user.' }
+    }
+}
+. (Join-Path $baseDir 'RuntimeBridge.ps1')
+. (Join-Path $baseDir 'ModelQuota.ps1')
+. (Join-Path $baseDir 'RotationCore.ps1')
+if (Test-Path -LiteralPath $accDir) {
+    try { Set-RestrictedOwnerAcl $accDir } catch {}
+}
+$script:LastSwitchTime = [datetime]::MinValue
+
+if ($Reconcile) {
+    Repair-RotationState
+} elseif ($RunOnce) {
+    Invoke-AutoRotationCheck
+} elseif ($Daemon) {
+    $daemonMutex = [Threading.Mutex]::new($false, 'Local\AntigravityAutoHub.Daemon')
+    $daemonLocked = $false
+    try {
+        try { $daemonLocked = $daemonMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $daemonLocked = $true }
+        if (-not $daemonLocked) { return }
+        $bootCfg = Get-HubConfig
+        Write-RotatorLog "Daemon started; interval ${IntervalSeconds}s after each completed scan."
+        Write-RotatorLog "Automatic rotation: Gemini 5h or selected model below $($bootCfg.MinQuotaPercent)%; target above $($bootCfg.MinQuotaPercent)%; idle only; cooldown $($bootCfg.CooldownSeconds)s."
+        while ($true) {
+            try { Invoke-AutoRotationCheck }
+            catch { Write-RotatorLog 'Scan failed; retrying on next interval.' }
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    } finally {
+        if ($daemonLocked) { $daemonMutex.ReleaseMutex() }
+        $daemonMutex.Dispose()
+    }
+}

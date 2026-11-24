@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate PowerShell 5.1, Security Gates, and Tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File tests/Validate.ps1
+
+      - name: Build Verified Release Artifacts
+        id: build
+        shell: powershell
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = $env:INPUT_VERSION.Trim()
+          } else {
+            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?\z' -or $tag.Contains('..')) {
+            throw "Invalid release tag format: $tag"
+          }
+          $result = & .\scripts\Build-Release.ps1 -Version $tag -CommitSha $env:GITHUB_SHA -OutDir dist
+          $sums = [IO.File]::ReadAllText($result.ChecksumsPath, [Text.Encoding]::UTF8).Trim()
+          $notes = @(
+            "## Antigravity Auto-Hub $($result.Version)"
+            ""
+            "- **Version:** ``$($result.Version)``"
+            "- **Commit SHA:** ``$($result.CommitSha)``"
+            "- **Built (UTC):** ``$($result.BuiltAtUtc)``"
+            "- **Managed Files:** $($result.FileCount)"
+            ""
+            "### SHA-256 Checksums"
+            ""
+            '```text'
+            $sums
+            '```'
+          ) -join "`n"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $distDir = (Resolve-Path 'dist').ProviderPath
+          [IO.File]::WriteAllText((Join-Path $distDir 'RELEASE_NOTES.md'), ($notes + "`n"), $utf8NoBom)
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "tag=$tag`narchive=$($result.ArchivePath)`n", $utf8NoBom)
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.build.outputs.tag }}
+          ARCHIVE_PATH: ${{ steps.build.outputs.archive }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create $env:RELEASE_TAG `
+            $env:ARCHIVE_PATH `
+            dist/release-manifest.json `
+            dist/SHA256SUMS.txt `
+            --title "Antigravity Auto-Hub $env:RELEASE_TAG" `
+            --notes-file dist/RELEASE_NOTES.md `
+            --target $env:GITHUB_SHA

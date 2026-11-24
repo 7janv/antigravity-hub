@@ -1,0 +1,34 @@
+# Sensitive tokens & runtime files
+accounts/*.json
+accounts/**
+!accounts/.gitkeep
+work/
+dist/
+.backup/
+oauth.local.clixml
+.login-backup.dpapi
+rotation-state.json
+hub-config.json
+.hub-version
+.hub-version.json
+*.tmp
+current_active.txt
+rotator.log
+*.log
+.DS_Store
+Thumbs.db
+
+# Local handoffs, credentials and private backups
+HANDOFF.md
+handoff.md
+*.clixml
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.bundle
+backups/

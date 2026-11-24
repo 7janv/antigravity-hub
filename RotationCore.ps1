@@ -1,0 +1,901 @@
+# Rotation decisions use verified runtime identity, never quota deltas.
+try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch {}
+
+if ($null -eq $script:AccessTokenCache) { $script:AccessTokenCache = @{} }
+if ($null -eq $script:LastClosedIdeLogState) { $script:LastClosedIdeLogState = '' }
+
+function Get-Sha256Hex {
+    param([string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$Text)
+        $hash = $sha.ComputeHash($bytes)
+        return ([BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Clear-AccessTokenCache {
+    param([string]$RefreshToken = '')
+    if ($null -eq $script:AccessTokenCache) { $script:AccessTokenCache = @{}; return }
+    if ($RefreshToken) {
+        $key = Get-Sha256Hex $RefreshToken
+        $null = $script:AccessTokenCache.Remove($key)
+    } else {
+        $script:AccessTokenCache.Clear()
+    }
+}
+
+function Set-RestrictedOwnerAcl {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $isDir = Test-Path -LiteralPath $Path -PathType Container
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    $acl = if ($isDir) {
+        [System.IO.Directory]::GetAccessControl($Path, $sections)
+    } else {
+        [System.IO.File]::GetAccessControl($Path, $sections)
+    }
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existing in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        $null = $acl.RemoveAccessRuleSpecific($existing)
+    }
+    $rule = if ($isDir) {
+        New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+    } else {
+        New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+    }
+    $acl.AddAccessRule($rule)
+    if ($isDir) {
+        [System.IO.Directory]::SetAccessControl($Path, $acl)
+    } else {
+        [System.IO.File]::SetAccessControl($Path, $acl)
+    }
+}
+
+function Protect-AccountPayload {
+    param($Data)
+    $plain = if ($Data -is [string]) { $Data } else { $Data | ConvertTo-Json -Depth 10 -Compress }
+    if ([string]::IsNullOrEmpty($plain)) { throw 'Account payload is empty.' }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($plain)
+    $entropy = [Text.Encoding]::UTF8.GetBytes('AntigravityAutoHub.Account.v1')
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect(
+        $bytes,
+        $entropy,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    try {
+        $envelope = [ordered]@{
+            format = 'dpapi-v1'
+            protected_payload = [Convert]::ToBase64String($protected)
+        }
+        return ($envelope | ConvertTo-Json -Compress)
+    } finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
+function Unprotect-AccountPayload {
+    param([string]$RawText)
+    if ([string]::IsNullOrWhiteSpace($RawText)) { return $RawText }
+    $obj = $null
+    try { $obj = $RawText | ConvertFrom-Json -ErrorAction Stop } catch { return $RawText }
+    if ($obj -and $obj.PSObject.Properties['format'] -and [string]$obj.format -ceq 'dpapi-v1') {
+        $b64 = if ($obj.PSObject.Properties['protected_payload']) { [string]$obj.protected_payload } else { '' }
+        if (-not $b64) { throw 'Account credential cannot be decrypted by this Windows user.' }
+        try {
+            $cipher = [Convert]::FromBase64String($b64)
+            $entropy = [Text.Encoding]::UTF8.GetBytes('AntigravityAutoHub.Account.v1')
+            $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+                $cipher,
+                $entropy,
+                [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+            )
+            try {
+                return [Text.Encoding]::UTF8.GetString($plainBytes)
+            } finally {
+                [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+            }
+        } catch {
+            throw 'Account credential cannot be decrypted by this Windows user.'
+        }
+    }
+    return $RawText
+}
+
+function Save-AccountFile {
+    param([string]$Path, $Data)
+    $dir = Split-Path -Path $Path -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Set-RestrictedOwnerAcl $dir
+    }
+    $envelope = Protect-AccountPayload $Data
+    $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $envelope, [Text.UTF8Encoding]::new($false))
+        Set-RestrictedOwnerAcl $temp
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($temp, $Path) }
+        Set-RestrictedOwnerAcl $Path
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Read-AccountFile {
+    param([string]$Path, [switch]$AsRawJson)
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    $plain = Unprotect-AccountPayload $raw
+    if ($AsRawJson) { return $plain }
+    return ($plain | ConvertFrom-Json)
+}
+
+function Test-SafeAccountName {
+    param([string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+    if ($Name -notmatch '^[a-zA-Z0-9_.@-]+\z') { return $false }
+    if ($Name -in @('.','..')) { return $false }
+    if ($Name.EndsWith('.')) { return $false }
+    $stem = ($Name -split '\.')[0]
+    if ($stem -match '^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z') { return $false }
+    return $true
+}
+
+function Test-HttpUnauthorizedError {
+    param($ErrorRecord)
+    if (-not $ErrorRecord) { return $false }
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($resp -and $null -ne $resp.StatusCode -and [int]$resp.StatusCode -eq 401) { return $true }
+    } catch {}
+    try {
+        if ([string]$ErrorRecord.Exception.Message -match '(^|[^\d])401([^\d]|\z)|Unauthorized') { return $true }
+    } catch {}
+    return $false
+}
+
+function Invoke-GetFreshTokenSafe {
+    param($Token, [switch]$ForceRefresh)
+    if ($ForceRefresh) {
+        $cmd = Get-Command Get-FreshToken -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Parameters.ContainsKey('ForceRefresh')) {
+            return (Get-FreshToken $Token -ForceRefresh)
+        }
+    }
+    return (Get-FreshToken $Token)
+}
+
+function Get-RefreshToken {
+    param($Token)
+    if ($Token.token.refresh_token) { return $Token.token.refresh_token }
+    return $Token.refresh_token
+}
+
+function Get-FreshToken {
+    param($Token, [switch]$ForceRefresh)
+    if (-not $script:GoogleClientId -or -not $script:GoogleClientSecret) {
+        # UI closures may need to reload configuration. Stay within this clone;
+        # never borrow another installation's credentials via a fixed path.
+        if ($env:ANTIGRAVITY_GOOGLE_CLIENT_ID -and $env:ANTIGRAVITY_GOOGLE_CLIENT_SECRET) {
+            $script:GoogleClientId = $env:ANTIGRAVITY_GOOGLE_CLIENT_ID
+            $script:GoogleClientSecret = $env:ANTIGRAVITY_GOOGLE_CLIENT_SECRET
+        } else {
+            $configRoot = if ($baseDir) { $baseDir } else { $PSScriptRoot }
+            if ($configRoot) {
+                $localConfig = Join-Path $configRoot 'oauth.local.clixml'
+                if (Test-Path -LiteralPath $localConfig) {
+                    try {
+                        $config = Import-Clixml -LiteralPath $localConfig -ErrorAction Stop
+                        if ($config -is [pscredential]) {
+                            $script:GoogleClientId = $config.UserName
+                            $script:GoogleClientSecret = $config.GetNetworkCredential().Password
+                        }
+                    } catch { }
+                }
+            }
+        }
+    }
+    if (-not $script:GoogleClientId -or -not $script:GoogleClientSecret) { throw 'OAuth configuration missing.' }
+    $refresh = Get-RefreshToken $Token
+    if (-not $refresh) { throw 'Refresh token missing.' }
+    if ($null -eq $script:AccessTokenCache) { $script:AccessTokenCache = @{} }
+    $cacheKey = Get-Sha256Hex $refresh
+    $clientKey = Get-Sha256Hex ("$($script:GoogleClientId):$($script:GoogleClientSecret)")
+    $now = [datetime]::UtcNow
+    if (-not $ForceRefresh -and $script:AccessTokenCache.ContainsKey($cacheKey)) {
+        $cached = $script:AccessTokenCache[$cacheKey]
+        if ($cached -and $cached.CacheExpiresAt -gt $now -and $cached.ClientKey -eq $clientKey -and $cached.Payload) {
+            return $cached.Payload
+        }
+        $null = $script:AccessTokenCache.Remove($cacheKey)
+    }
+    $response = Invoke-RestMethod -Uri 'https://oauth2.googleapis.com/token' -Method Post -Body @{
+        client_id=$script:GoogleClientId; client_secret=$script:GoogleClientSecret
+        refresh_token=$refresh; grant_type='refresh_token'
+    } -TimeoutSec 10 -ErrorAction Stop
+    if (-not $response.access_token) { throw 'Invalid token response.' }
+    $expiresIn = 1800
+    $ttl = 1800
+    if ($null -ne $response.expires_in) {
+        if ([int]$response.expires_in -le 0) { throw 'Invalid token response.' }
+        $expiresIn = [int]$response.expires_in
+        $ttl = [math]::Min(1800, [math]::Max(60, $expiresIn - 60))
+    }
+    $newRefresh = if ($response.refresh_token) { [string]$response.refresh_token } else { $refresh }
+    $payload = [pscustomobject]@{
+        auth_method = 'consumer'
+        token = [pscustomobject]@{
+            access_token=$response.access_token; token_type='Bearer'
+            refresh_token=$newRefresh
+            expiry=$now.AddSeconds($expiresIn).ToString('o')
+        }
+    }
+    $entry = [pscustomobject]@{
+        Payload = $payload
+        CacheExpiresAt = $now.AddSeconds($ttl)
+        ClientKey = $clientKey
+    }
+    $script:AccessTokenCache[$cacheKey] = $entry
+    if ($newRefresh -ne $refresh) {
+        $script:AccessTokenCache[(Get-Sha256Hex $newRefresh)] = $entry
+    }
+    return $payload
+}
+
+function Convert-QuotaSummary {
+    param($Response)
+    $five = @(); $weekly = @(); $argon = @()
+    foreach ($group in $Response.groups) {
+        $groupText = "$($group.displayName) $($group.description)"
+        if ($groupText -notmatch 'gemini|argon' -or $group.displayName -match 'orchestrator') { continue }
+        $groupIsArgon = ([string]$group.displayName -match 'argon')
+        foreach ($bucket in $group.buckets) {
+            if ($null -eq $bucket.remainingFraction) { continue }
+            $fraction = 0.0
+            if (-not [double]::TryParse([string]$bucket.remainingFraction,
+                [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$fraction)) { continue }
+            if ([double]::IsNaN($fraction) -or $fraction -lt 0 -or $fraction -gt 1) { continue }
+            $bucketIsArgon = $groupIsArgon -or ("$($bucket.bucketId) $($bucket.displayName)" -match 'argon')
+            if ($bucketIsArgon) {
+                if ($bucket.window -match '^(5h|week|weekly|7d)$' -or -not $bucket.window) { $argon += $fraction }
+            } elseif ($bucket.window -match '^5h$') { $five += $fraction }
+            elseif ($bucket.window -match '^(week|weekly|7d)$') { $weekly += $fraction }
+        }
+    }
+    if (-not $five.Count -or -not $weekly.Count) { throw 'Quota windows unavailable; no rotation.' }
+    $argonMin = if ($argon.Count) { [double]($argon | Measure-Object -Minimum).Minimum } else { -1.0 }
+    [pscustomobject]@{
+        Gemini5H=($five | Measure-Object -Minimum).Minimum
+        GeminiWeekly=($weekly | Measure-Object -Minimum).Minimum
+        ArgonWeekly=$argonMin
+    }
+}
+
+function Convert-ArgonModelQuota {
+    param($Response)
+    $entries=@($Response.models.PSObject.Properties | Where-Object {
+        ($_.Name -match '(^|[-_])argon([-_]|$)' -or $_.Value.displayName -match '\bargon\b') -and
+            "$($_.Name) $($_.Value.displayName)" -notmatch 'orchestrator'
+    })
+    $disabled=0; $fractions=@(); $incomplete=$false
+    foreach ($entry in $entries) {
+        $model=$entry.Value
+        if ($model.disabled -is [bool] -and $model.disabled) { $disabled++; continue }
+        if ($null -ne $model.disabled -and $model.disabled -isnot [bool]) { $incomplete=$true; continue }
+        $fraction=0.0
+        if ($null -eq $model.quotaInfo.remainingFraction -or
+            -not [double]::TryParse([string]$model.quotaInfo.remainingFraction,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$fraction) -or
+            [double]::IsNaN($fraction) -or $fraction -lt 0 -or $fraction -gt 1) { $incomplete=$true; continue }
+        $fractions+=$fraction
+    }
+    if ($entries.Count -gt 0 -and $disabled -eq $entries.Count) {
+        return [pscustomobject]@{Status='Disabled';Remaining=-1.0}
+    }
+    if ($fractions.Count -gt 0 -and -not $incomplete) {
+        return [pscustomobject]@{Status='Available';Remaining=[double]($fractions|Measure-Object -Minimum).Minimum}
+    }
+    return [pscustomobject]@{Status='Unknown';Remaining=-1.0}
+}
+
+function Convert-AccountPlan {
+    param($Response)
+    # A paid entitlement overrides the service's free currentTier. Never infer
+    # a subscription from allowedTiers, upgrade copy, model access or quota.
+    $tier=$Response.currentTier; $source='CurrentTier'
+    if ($null -ne $Response.paidTier) { $tier=$Response.paidTier; $source='PaidTier' }
+    $plan='Unknown'
+    if ($tier) {
+        switch -Exact ([string]$tier.id) {
+            'free-tier' { if($source -eq 'CurrentTier'){$plan='Free'} }
+            'g1-pro-tier' { $plan='Pro' }
+            'g1-ultra-tier' { $plan='Ultra' }
+        }
+    }
+    [pscustomobject]@{Name=$plan;Source=$(if($plan -eq 'Unknown'){''}else{$source})}
+}
+
+function Get-AccountQuotaInfo {
+    param([string]$tokenFilePath,[switch]$IncludeModels)
+    $result = [ordered]@{
+        Success=$false; Email=''; Gemini5H=-1.0; GeminiWeekly=-1.0; ArgonWeekly=-1.0
+        ArgonStatus='Unknown'; ArgonQuotaSource=''
+        Plan='Unknown'; PlanSource=''
+        ModelQuotas=@(); QuotaGroups=@(); ModelsStatus='NotRequested'; CheckedAt=''
+        TokenPath=$tokenFilePath; AccountName=[IO.Path]::GetFileNameWithoutExtension($tokenFilePath)
+        Error='Quota unavailable'; ErrorCode='QuotaUnavailable'; VerificationUrl=$null
+    }
+    $rawTokenObj = $null
+    for ($authAttempt = 0; $authAttempt -lt 2; $authAttempt++) {
+        $quotaFailure = $null
+        try {
+            if ($null -eq $rawTokenObj) {
+                $rawTokenObj = Read-AccountFile $tokenFilePath
+            }
+            $token = Invoke-GetFreshTokenSafe $rawTokenObj -ForceRefresh:($authAttempt -gt 0)
+            $headers = @{Authorization="Bearer $($token.token.access_token)"; 'User-Agent'='antigravity/hub/2.25.0 (os_type=windows; arch=amd64; aidev_client; cl=1003374690; auth_method=consumer)'}
+            $user = Invoke-RestMethod -Uri 'https://www.googleapis.com/oauth2/v3/userinfo' -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+            if (-not $user.email) { throw 'Account email unavailable.' }
+            $result.Email = $user.email
+            $project = Invoke-RestMethod -Uri 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist' -Method Post -Headers $headers -Body '{}' -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop
+            $plan=Convert-AccountPlan $project
+            $result.Plan=$plan.Name; $result.PlanSource=$plan.Source
+            $projectId = $project.cloudaicompanionProject
+            if ($projectId -and $projectId -isnot [string]) { $projectId = $projectId.id }
+            if (-not $projectId) { $projectId = $project.project }
+            if (-not $projectId -or $projectId -isnot [string]) { throw 'Project ID unavailable.' }
+            $models=$null
+            if($IncludeModels){
+                $result.ModelsStatus='Unavailable'
+                try {
+                    $models=Invoke-RestMethod -Uri 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels' -Method Post -Headers $headers -Body (@{project=$projectId}|ConvertTo-Json -Compress) -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop
+                    if($null -ne $models.models){
+                        $result.ModelQuotas=@(Convert-ModelQuotaCatalog $models)
+                        $result.ModelsStatus='Available'
+                    }
+                } catch {
+                    if ($authAttempt -eq 0 -and (Test-HttpUnauthorizedError $_)) { throw }
+                }
+            }
+            $response = Invoke-RestMethod -Uri 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary' -Method Post -Headers $headers -Body (@{project=$projectId} | ConvertTo-Json -Compress) -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop
+            if($IncludeModels){$result.QuotaGroups=@(Convert-QuotaGroups $response)}
+            $quota = Convert-QuotaSummary $response
+            $result.Gemini5H=$quota.Gemini5H; $result.GeminiWeekly=$quota.GeminiWeekly; $result.ArgonWeekly=$quota.ArgonWeekly
+            if ($quota.ArgonWeekly -ge 0) {
+                $result.ArgonStatus='Available'; $result.ArgonQuotaSource='Summary'
+            } else {
+                # Query this account directly: no IDE login/switch or generation call.
+                # A missing summary bucket can mean model-disabled, shared/model quota,
+                # or missing data. Never substitute generic Gemini quota for Argon.
+                try {
+                    if(-not $IncludeModels){$models=Invoke-RestMethod -Uri 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels' -Method Post -Headers $headers -Body (@{project=$projectId}|ConvertTo-Json -Compress) -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop}
+                    $argon=Convert-ArgonModelQuota $models
+                    $result.ArgonStatus=$argon.Status; $result.ArgonWeekly=$argon.Remaining
+                    $result.ArgonQuotaSource='ModelCatalog'
+                } catch { } # Preserve valid Gemini quota; Argon remains unknown.
+            }
+            $result.Success=$true; $result.Error=''; $result.ErrorCode=''
+            break
+        } catch {
+            $quotaFailure = $_
+            if ($authAttempt -eq 0 -and $null -ne $rawTokenObj -and (Test-HttpUnauthorizedError $quotaFailure)) {
+                $rt = Get-RefreshToken $rawTokenObj
+                if ($rt) { Clear-AccessTokenCache $rt }
+                $result.Email=''; $result.Plan='Unknown'; $result.PlanSource=''
+                $result.ModelQuotas=@(); $result.QuotaGroups=@(); $result.ModelsStatus='NotRequested'
+                continue
+            }
+            # Read only the documented error discriminator; never log provider bodies.
+            try {
+                $errorBody=$quotaFailure.ErrorDetails.Message
+                # Windows PowerShell 5.1 leaves ErrorDetails empty for this 403.
+                if(-not $errorBody -and $quotaFailure.Exception.Response -is [Net.HttpWebResponse]) {
+                    $reader=[IO.StreamReader]::new($quotaFailure.Exception.Response.GetResponseStream())
+                    try {
+                        $buffer=New-Object char[] 4096
+                        $text=[Text.StringBuilder]::new()
+                        while(($count=$reader.Read($buffer,0,$buffer.Length)) -gt 0) {
+                            if($text.Length+$count -gt 65536){throw 'Quota error response too large'}
+                            $null=$text.Append($buffer,0,$count)
+                        }
+                        $errorBody=$text.ToString()
+                    } finally { $reader.Dispose() }
+                }
+                $failure=$errorBody | ConvertFrom-Json -ErrorAction Stop
+                foreach($detail in $failure.error.details) {
+                    if($detail.'@type' -ne 'type.googleapis.com/google.rpc.ErrorInfo' -or $detail.reason -ne 'VALIDATION_REQUIRED'){continue}
+                    $result.ErrorCode='AccountVerificationRequired'
+                    $result.Error='Google account verification required'
+                    $uri=$null
+                    if([uri]::TryCreate([string]$detail.metadata.validation_url,[UriKind]::Absolute,[ref]$uri) -and
+                        $uri.Scheme -eq 'https' -and $uri.Host -eq 'accounts.google.com' -and
+                        $uri.IsDefaultPort -and -not $uri.UserInfo -and $uri.AbsolutePath -ceq '/signin/continue') {
+                        $result.VerificationUrl=$uri.AbsoluteUri
+                    }
+                    break
+                }
+            } catch { } # Unknown/malformed errors remain unavailable; no guessed quota.
+            break
+        }
+    }
+    $result.CheckedAt=[datetime]::UtcNow.ToString('o')
+    [pscustomobject]$result
+}
+
+function Get-AllAccountsQuota {
+    param([switch]$IncludeModels)
+    $dir=if($accDir){$accDir}elseif($script:accDir){$script:accDir}else{Join-Path (Split-Path $PSCommandPath) 'accounts'}
+    foreach ($file in (Get-ChildItem -LiteralPath $dir -Filter '*.json')) {
+        Get-AccountQuotaInfo $file.FullName -IncludeModels:$IncludeModels
+    }
+}
+
+function Get-CurrentActiveName {
+    try {
+        $runtime = Get-RuntimeIdentity
+        if (-not $runtime) { return '' }
+        # Only trust the last marker if the runtime confirms its stored email.
+        $state = Read-RotationState
+        if ($state.Status -eq 'Verified' -and $state.Email -eq $runtime.Email) { return $state.Account }
+        foreach ($account in (Get-AllAccountsQuota)) {
+            if ($account.Email -eq $runtime.Email) { return $account.AccountName }
+        }
+    } catch { }
+    return ''
+}
+
+function Read-RotationState {
+    if (Test-Path -LiteralPath $stateFile) {
+        try { return Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch { return [pscustomobject]@{Status='NeedsAttention'} }
+    }
+    return $null
+}
+
+function Write-AtomicText {
+    param([string]$Path, [string]$Text)
+    $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $Text, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($temp, $Path) }
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+
+function Set-RotationState {
+    param([string]$Status, [string]$Account='', [string]$Email='', [string]$UpdatedAt='')
+    if (-not $UpdatedAt) { $UpdatedAt = [datetime]::UtcNow.ToString('o') }
+    Write-AtomicText $stateFile (@{Status=$Status;Account=$Account;Email=$Email;UpdatedAt=$UpdatedAt} | ConvertTo-Json -Compress)
+}
+
+function Set-StoredCredential {
+    param([string]$Content)
+    if (-not [WinCred]::Write('gemini:antigravity', 'antigravity', $Content)) { throw 'Credential Manager write failed.' }
+    if ([WinCred]::Read('gemini:antigravity') -cne $Content) { throw 'Credential read-back mismatch.' }
+    $folder = Split-Path $geminiTokenPath
+    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        try { Set-RestrictedOwnerAcl $folder } catch {}
+    }
+    Write-AtomicText $geminiTokenPath $Content
+    try { Set-RestrictedOwnerAcl $geminiTokenPath } catch {}
+}
+
+function Get-StoredCredential { [WinCred]::Read('gemini:antigravity') }
+
+function Remove-StoredCredential { [WinCred]::Delete('gemini:antigravity') }
+
+function Get-CredentialEmail {
+    param([string]$Content)
+    $parsed = $Content | ConvertFrom-Json
+    for ($authAttempt = 0; $authAttempt -lt 2; $authAttempt++) {
+        try {
+            $token = Invoke-GetFreshTokenSafe $parsed -ForceRefresh:($authAttempt -gt 0)
+            $user = Invoke-RestMethod 'https://www.googleapis.com/oauth2/v3/userinfo' -Headers @{Authorization="Bearer $($token.token.access_token)"} -TimeoutSec 10 -ErrorAction Stop
+            if (-not $user.email) { throw 'Rollback credential identity unavailable.' }
+            return $user.email
+        } catch {
+            if ($authAttempt -eq 0 -and (Test-HttpUnauthorizedError $_)) {
+                $rt = Get-RefreshToken $parsed
+                if ($rt) { Clear-AccessTokenCache $rt }
+                continue
+            }
+            throw
+        }
+    }
+}
+
+function Restore-StoredCredential {
+    param([string]$Content)
+    if (-not [WinCred]::Write('gemini:antigravity','antigravity',$Content)) { throw 'Rollback failed.' }
+    if ([WinCred]::Read('gemini:antigravity') -cne $Content) { throw 'Rollback read-back mismatch.' }
+}
+
+function Get-SwitchFailureMessage {
+    param([string]$Code)
+    # Fixed allowlist only: never display raw HTTP errors, credentials or URLs.
+    switch ($Code) {
+        'SwitchBusy' { return "$([char]0x0110)ang c$([char]0x00F3) phi$([char]0x00EA)n $([char]0x0111)$([char]0x0103)ng nh$([char]0x1EAD)p ho$([char]0x1EB7)c chuy$([char]0x1EC3)n t$([char]0x00E0)i kho$([char]0x1EA3)n kh$([char]0x00E1)c. Ch$([char]0x1EDD) ho$([char]0x00E0)n t$([char]0x1EA5)t r$([char]0x1ED3)i th$([char]0x1EED) l$([char]0x1EA1)i." }
+        'SwitchCooldown' { return "$([char]0x0110)ang trong th$([char]0x1EDD)i gian ch$([char]0x1EDD) 120 gi$([char]0x00E2)y sau l$([char]0x1EA7)n chuy$([char]0x1EC3)n g$([char]0x1EA7)n nh$([char]0x1EA5)t." }
+        'SwitchAgentRunning' { return "Antigravity $([char]0x0111)ang ch$([char]0x1EA1)y t$([char]0x00E1)c v$([char]0x1EE5). S$([char]0x1EBD) chuy$([char]0x1EC3)n khi t$([char]0x00E1)c v$([char]0x1EE5) ho$([char]0x00E0)n t$([char]0x1EA5)t." }
+        'Unsaved draft or focused editor; rotation deferred.' { return "$([char]0x0110)ang c$([char]0x00F3) b$([char]0x1EA3)n nh$([char]0x00E1)p ch$([char]0x01B0)a g$([char]0x1EED)i ho$([char]0x1EB7)c $([char]0x00F4) nh$([char]0x1EAD)p $([char]0x0111)ang $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c ch$([char]0x1ECD)n trong Antigravity. G$([char]0x1EED)i/l$([char]0x01B0)u b$([char]0x1EA3)n nh$([char]0x00E1)p r$([char]0x1ED3)i chuy$([char]0x1EC3)n sang Hub." }
+        'An editor is active; switch deferred.' { return "$([char]0x00D4) nh$([char]0x1EAD)p Antigravity v$([char]0x1EEB)a ho$([char]0x1EA1)t $([char]0x0111)$([char]0x1ED9)ng. $([char]0x0110)$([char]0x00E3) ho$([char]0x00E3)n chuy$([char]0x1EC3)n $([char]0x0111)$([char]0x1EC3) b$([char]0x1EA3)o v$([char]0x1EC7) n$([char]0x1ED9)i dung." }
+        'An agent became active; switch deferred.' { return "Antigravity v$([char]0x1EEB)a b$([char]0x1EAF)t $([char]0x0111)$([char]0x1EA7)u t$([char]0x00E1)c v$([char]0x1EE5) m$([char]0x1EDB)i. $([char]0x0110)$([char]0x00E3) ho$([char]0x00E3)n chuy$([char]0x1EC3)n." }
+        'Previous switch requires reconciliation.' { return "L$([char]0x1EA7)n chuy$([char]0x1EC3)n tr$([char]0x01B0)$([char]0x1EDB)c c$([char]0x1EA7)n ki$([char]0x1EC3)m tra. B$([char]0x1EA5)m Qu$([char]0x00E9)t Quota $([char]0x0111)$([char]0x1EC3) $([char]0x0111)$([char]0x1ED1)i chi$([char]0x1EBF)u t$([char]0x00E0)i kho$([char]0x1EA3)n." }
+        'Target quota unavailable or exhausted.' { return "T$([char]0x00E0)i kho$([char]0x1EA3)n $([char]0x0111)$([char]0x00ED)ch ch$([char]0x01B0)a $([char]0x0111)$([char]0x1ECD)c $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c quota ho$([char]0x1EB7)c quota qu$([char]0x00E1) th$([char]0x1EA5)p." }
+        'Stored credential does not match the runtime; reconcile before switching.' { return "T$([char]0x00E0)i kho$([char]0x1EA3)n l$([char]0x01B0)u trong Windows kh$([char]0x00E1)c t$([char]0x00E0)i kho$([char]0x1EA3)n Antigravity $([char]0x0111)ang d$([char]0x00F9)ng. C$([char]0x1EA7)n $([char]0x0111)$([char]0x1ED1)i chi$([char]0x1EBF)u l$([char]0x1EA1)i." }
+        'Debugger unavailable.' { return "Ch$([char]0x01B0)a k$([char]0x1EBF)t n$([char]0x1ED1)i $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c c$([char]0x1EED)a s$([char]0x1ED5) Antigravity $([char]0x0111)$([char]0x1EC3) b$([char]0x1EA3)o v$([char]0x1EC7) b$([char]0x1EA3)n nh$([char]0x00E1)p." }
+        'Selected model changed or unavailable.' { return 'Model da thay doi hoac chua xac minh duoc. Hub hoan chuyen; hay quet lai.' }
+        'New runtime identity not confirmed.' { return "Ch$([char]0x01B0)a x$([char]0x00E1)c minh $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c t$([char]0x00E0)i kho$([char]0x1EA3)n m$([char]0x1EDB)i. T$([char]0x1EF1) $([char]0x0111)$([char]0x1ED9)ng xoay $([char]0x0111)$([char]0x00E3) t$([char]0x1EA1)m d$([char]0x1EEB)ng." }
+        'Window changed or user is editing; cannot restore navigation.' { return "T$([char]0x00E0)i kho$([char]0x1EA3)n $([char]0x0111)$([char]0x00E3) $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c x$([char]0x1EED) l$([char]0x00FD) nh$([char]0x01B0)ng c$([char]0x1EED)a s$([char]0x1ED5) thay $([char]0x0111)$([char]0x1ED5)i ho$([char]0x1EB7)c $([char]0x0111)ang nh$([char]0x1EAD)p. C$([char]0x1EA7)n ki$([char]0x1EC3)m tra tr$([char]0x01B0)$([char]0x1EDB)c khi xoay ti$([char]0x1EBF)p." }
+        default { return "Ch$([char]0x01B0)a chuy$([char]0x1EC3)n $([char]0x0111)$([char]0x01B0)$([char]0x1EE3)c t$([char]0x00E0)i kho$([char]0x1EA3)n. Ki$([char]0x1EC3)m tra k$([char]0x1EBF)t n$([char]0x1ED1)i, c$([char]0x1EA5)u h$([char]0x00EC)nh OAuth v$([char]0x00E0) tr$([char]0x1EA1)ng th$([char]0x00E1)i Hub." }
+    }
+}
+
+function Switch-ActiveAccount {
+    param([string]$targetAccountName, [string]$Reason='', [switch]$Notify,[string]$ExpectedModel='',[string]$ExpectedEmail='',[switch]$Manual)
+    $ErrorActionPreference='Stop'
+    $script:LastSwitchMessage=''
+    $mutex = [Threading.Mutex]::new($false, 'Local\AntigravityAutoHub.Switch')
+    $locked=$false; $written=$false; $oldCredential=$null; $oldFile=$null; $oldEmail=''
+    $restartedForSwitch=$false; $postRestartRuntime=$null; $modelMismatchRollback=$false
+    try {
+        try { $locked=$mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked=$true }
+        if (-not $locked) { throw 'SwitchBusy' }
+        $state = Read-RotationState
+        if ($state.Status -in @('Switching','NeedsAttention')) {
+            if (-not (Repair-RotationState) -and -not $Manual) { throw 'Previous switch requires reconciliation.' }
+            $state = Read-RotationState
+        }
+        $cooldownSec = if (Get-Command Get-HubConfig -ErrorAction SilentlyContinue) { (Get-HubConfig).CooldownSeconds } else { 120 }
+        if (-not $Manual -and $state -and $state.UpdatedAt -and ([datetime]::UtcNow - ([datetime]$state.UpdatedAt).ToUniversalTime()).TotalSeconds -lt $cooldownSec) { throw 'SwitchCooldown' }
+        if (-not (Test-SafeAccountName $targetAccountName)) { throw 'Invalid account name.' }
+        $source = Join-Path $accDir "$targetAccountName.json"
+        $runtime = Get-RuntimeIdentity
+        if(-not $Manual -and $ExpectedEmail -and $runtime.Email -ne $ExpectedEmail){throw 'Selected model changed or unavailable.'}
+        $selectedModel=''
+        if($runtime -and $runtime.Runtimes){try{$selectedModel=Get-RuntimeSelectedModel $runtime.Runtimes[0]}catch{}}
+        if(-not $Manual -and $ExpectedModel -and (Get-ModelSelectionKey $selectedModel) -ne (Get-ModelSelectionKey $ExpectedModel)){throw 'Selected model changed or unavailable.'}
+        $quota = Get-AccountQuotaInfo $source -IncludeModels:([bool]$selectedModel)
+        $argonLimit = if ($null -ne $MinArgonThreshold) { [double]$MinArgonThreshold } else { [double]$MinWeeklyThreshold }
+        $argonExhausted = $null -ne $quota.ArgonWeekly -and $quota.ArgonWeekly -ge 0 -and $quota.ArgonWeekly -le $argonLimit
+        $cfgThreshold = if (Get-Command Get-HubConfig -ErrorAction SilentlyContinue) { [double](Get-HubConfig).MinQuotaPercent / 100.0 } else { [double]$MinQuotaThreshold }
+        $is5hRotation = ($Reason -like 'Gemini 5h*')
+        if (-not $Manual) {
+            if ($is5hRotation -and -not $ExpectedModel) {
+                if (-not $quota.Success -or $quota.Gemini5H -le $cfgThreshold) { throw 'Target quota unavailable or exhausted.' }
+            } elseif ($selectedModel) {
+                $modelQuota = Get-SelectedModelQuota $quota $selectedModel
+                if (-not $modelQuota.Known -or $modelQuota.Remaining -le $cfgThreshold) { throw 'Target quota unavailable or exhausted.' }
+            } elseif (-not $quota.Success -or $quota.Gemini5H -le $cfgThreshold -or $quota.GeminiWeekly -le $MinWeeklyThreshold -or $argonExhausted) {
+                throw 'Target quota unavailable or exhausted.'
+            }
+        } elseif (-not $quota.Success) {
+            throw 'Target quota unavailable or exhausted.'
+        }
+        $fresh = Get-FreshToken (Read-AccountFile $source)
+        $runtime = Get-RuntimeIdentity
+        if(-not $Manual -and $ExpectedEmail -and $runtime.Email -ne $ExpectedEmail){throw 'Selected model changed or unavailable.'}
+        if (-not $Manual -and $runtime -and (-not $runtime.Idle)) {
+            throw 'SwitchAgentRunning'
+        }
+        if ($runtime -and $runtime.Email -eq $quota.Email) { return $true }
+        $savedWindows = @()
+        if ($runtime) {
+            $isNoCsrf = [bool]($runtime.Runtimes -and $runtime.Runtimes[0].PSObject.Properties['NoCsrfBridge'] -and $runtime.Runtimes[0].NoCsrfBridge)
+            try {
+                $savedWindows = @(Get-RuntimeWindows $runtime.Runtimes[0])
+            } catch {
+                if ($Manual) {
+                    $savedWindows = @()
+                } elseif ($isNoCsrf -and $_.Exception.Message -eq 'Debugger unavailable.') {
+                    $savedWindows = @()
+                } else {
+                    throw
+                }
+            }
+            if (-not $Manual -and @($savedWindows | Where-Object { -not $_.Safe }).Count) { throw 'Unsaved draft or focused editor; rotation deferred.' }
+        }
+        if ($runtime) { $oldEmail=$runtime.Email }
+        $oldCredential=Get-StoredCredential
+        if (-not $oldCredential -and (Test-Path -LiteralPath $geminiTokenPath)) {
+            $oldCredential=[IO.File]::ReadAllText($geminiTokenPath)
+        }
+        if (-not $Manual -and -not $oldCredential) { throw 'Missing rollback credential.' }
+        if (-not $Manual -and $runtime -and $oldCredential -and (Get-CredentialEmail $oldCredential) -ne $oldEmail) { throw 'Stored credential does not match the runtime; reconcile before switching.' }
+        if(-not $Manual -and $selectedModel -and (Get-ModelSelectionKey (Get-RuntimeSelectedModel $runtime.Runtimes[0])) -ne (Get-ModelSelectionKey $selectedModel)){throw 'Selected model changed or unavailable.'}
+        if (Test-Path -LiteralPath $geminiTokenPath) { $oldFile=[IO.File]::ReadAllText($geminiTokenPath) }
+        Set-RotationState 'Switching' $targetAccountName $quota.Email
+        $written=$true
+        Set-StoredCredential ($fresh | ConvertTo-Json -Depth 10 -Compress)
+        if ($runtime) {
+            $script:PreviousRuntimePids = @($runtime.Runtimes | ForEach-Object { $_.ProcessId })
+            foreach ($server in $runtime.Runtimes) { Restart-AntigravityRuntime $server -Force:$Manual }
+            $restartedForSwitch=$true
+            $verified = Wait-AntigravityIdentity $quota.Email
+            $script:PreviousRuntimePids = @()
+            if (-not $verified) { throw 'New runtime identity not confirmed.' }
+            if ($savedWindows.Count) {
+                try { Restore-RuntimeWindows $savedWindows } catch { }
+            }
+            if(-not $Manual -and $selectedModel -and (-not $is5hRotation -or $ExpectedModel)){
+                $confirmed=$false
+                for($attempt=0;$attempt -lt 5;$attempt++){
+                    $newRuntime=Get-RuntimeIdentity
+                    if ($newRuntime) { $postRestartRuntime=$newRuntime }
+                    $newModel=Get-RuntimeSelectedModel $newRuntime.Runtimes[0]
+                    if((Get-ModelSelectionKey $newModel) -eq (Get-ModelSelectionKey $selectedModel)){$confirmed=$true;break}
+                    if($newModel){break}
+                    Start-Sleep -Milliseconds 500
+                }
+                if(-not $confirmed){
+                    $modelMismatchRollback=$true
+                    throw 'Selected model changed or unavailable.'
+                }
+            }
+            Set-RotationState 'Verified' $targetAccountName $quota.Email
+            Write-AtomicText $activeFile $targetAccountName
+            Write-RotatorLog "Verified IDE account: [$targetAccountName]."
+        } else {
+            Set-RotationState 'Prepared' $targetAccountName $quota.Email
+            if ($Manual) { Write-AtomicText $activeFile $targetAccountName }
+            Write-RotatorLog "Account [$targetAccountName] prepared for next IDE launch (not yet verified)."
+        }
+        $script:LastSwitchTime=Get-Date
+        if ($Notify) {
+            $message = if ($runtime) { "$([char]0x110)$([char]0xE3) x$([char]0xE1)c minh t$([char]0xE0)i kho$([char]0x1EA3)n IDE: [$targetAccountName]" }
+                else { "$([char]0x110)$([char]0xE3) chu$([char]0x1EA9)n b$([char]0x1ECB) t$([char]0xE0)i kho$([char]0x1EA3)n cho l$([char]0x1EA7)n m$([char]0x1EDF) IDE ti$([char]0x1EBF)p theo: [$targetAccountName]" }
+            Send-ToastNotification -Message $message
+        }
+        return $true
+    } catch {
+        $script:LastSwitchMessage=Get-SwitchFailureMessage $_.Exception.Message
+        if ($written) {
+            $restored=$false
+            try {
+                if ($null -ne $oldCredential) {
+                    Restore-StoredCredential $oldCredential
+                } else {
+                    if (-not (Remove-StoredCredential)) { throw 'Rollback delete failed.' }
+                }
+                if ($null -ne $oldFile) {
+                    Write-AtomicText $geminiTokenPath $oldFile
+                    try { Set-RestrictedOwnerAcl $geminiTokenPath } catch {}
+                }
+                elseif (Test-Path -LiteralPath $geminiTokenPath) { [IO.File]::Delete($geminiTokenPath) }
+                if ($restartedForSwitch -and $modelMismatchRollback) {
+                    try {
+                        $rollbackRuntime = if ($postRestartRuntime -and $postRestartRuntime.Runtimes) { $postRestartRuntime } else { Get-RuntimeIdentity }
+                        if ($rollbackRuntime -and $rollbackRuntime.Runtimes) {
+                            foreach ($srv in $rollbackRuntime.Runtimes) {
+                                Restart-AntigravityRuntime $srv -Force
+                            }
+                        }
+                    } catch { }
+                }
+                $restored=$true
+            } catch { }
+            Set-RotationState 'NeedsAttention' '' $oldEmail
+            Write-RotatorLog "Switch unverified. Stored credential restored: $restored. Automatic rotation paused."
+        }
+        Write-RotatorLog ('Switch deferred: ' + $script:LastSwitchMessage)
+        if ($Notify) { Send-ToastNotification -Message $script:LastSwitchMessage }
+        return $false
+    } finally {
+        $script:PreviousRuntimePids = @()
+        if ($locked) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Get-StoredActiveAccountName {
+    try {
+        $credRaw = Get-StoredCredential
+        if (-not $credRaw -and (Test-Path -LiteralPath $geminiTokenPath)) {
+            $credRaw = [IO.File]::ReadAllText($geminiTokenPath)
+        }
+        if (-not $credRaw) { return '' }
+        $credObj = $credRaw | ConvertFrom-Json
+        $refresh = Get-RefreshToken $credObj
+        if ($refresh -and (Test-Path -LiteralPath $accDir)) {
+            foreach ($file in (Get-ChildItem -LiteralPath $accDir -Filter '*.json')) {
+                try {
+                    $saved = Read-AccountFile $file.FullName
+                    if ((Get-RefreshToken $saved) -eq $refresh) { return $file.BaseName }
+                } catch {}
+            }
+        }
+        $email = Get-CredentialEmail $credRaw
+        if ($email) {
+            foreach ($account in (Get-AllAccountsQuota)) {
+                if ($account.Email -eq $email) { return $account.AccountName }
+            }
+        }
+    } catch {}
+    return ''
+}
+
+function Invoke-CliAutoRotationCheck {
+    param($Config, [double]$Threshold)
+    $activeName = Get-StoredActiveAccountName
+    if (-not $activeName) { Write-RotatorLog 'CLI mode: active credential not matched to account pool; monitoring only.'; return }
+    $accounts = @(Get-AllAccountsQuota -IncludeModels)
+    $current = $accounts | Where-Object { $_.AccountName -eq $activeName } | Select-Object -First 1
+    if (-not $current -or -not $current.Success) { Write-RotatorLog 'CLI mode: active account quota unknown; no rotation.'; return }
+    $g5 = if ($current.Gemini5H -ge 0) { "$([math]::Round($current.Gemini5H*100,1))%" } else { 'N/A' }
+    $gw = if ($current.GeminiWeekly -ge 0) { "$([math]::Round($current.GeminiWeekly*100,1))%" } else { 'N/A' }
+    Write-RotatorLog "CLI active [$($current.AccountName)]: Gemini5H=$g5 Weekly=$gw."
+    $low5h = ($current.Gemini5H -ge 0 -and $current.Gemini5H -lt $Threshold)
+    $lowWeekly = ($current.GeminiWeekly -ge 0 -and $current.GeminiWeekly -lt $Threshold)
+    $lowArgon = ($null -ne $current.ArgonWeekly -and $current.ArgonWeekly -ge 0 -and $current.ArgonWeekly -lt $Threshold)
+    if (-not ($low5h -or $lowWeekly -or $lowArgon)) { return }
+    $best = $accounts | Where-Object {
+        $_.AccountName -ne $current.AccountName -and $_.Success -and
+        $_.Gemini5H -gt $Threshold -and $_.GeminiWeekly -gt $Threshold -and
+        ($null -eq $_.ArgonWeekly -or $_.ArgonWeekly -lt 0 -or $_.ArgonWeekly -gt $Threshold)
+    } | ForEach-Object {
+        $score = [math]::Min($_.Gemini5H, $_.GeminiWeekly)
+        if ($null -ne $_.ArgonWeekly -and $_.ArgonWeekly -ge 0) { $score = [math]::Min($score, $_.ArgonWeekly) }
+        [pscustomobject]@{ AccountName = $_.AccountName; Score = $score }
+    } | Sort-Object @{Expression='Score';Descending=$true}, AccountName | Select-Object -First 1
+    if (-not $best) { Write-RotatorLog 'CLI mode: no healthy account available; waiting for quota reset.'; return }
+    Switch-ActiveAccount $best.AccountName -Reason "CLI quota below $($Config.MinQuotaPercent) percent" -Notify | Out-Null
+}
+
+function Invoke-AutoRotationCheck {
+    $cfg = if (Get-Command Get-HubConfig -ErrorAction SilentlyContinue) { Get-HubConfig } else { [pscustomobject]@{AutoRotationEnabled=$true;CliRotationEnabled=$true;PauseScanWhenIdeClosed=$true;MinQuotaPercent=20;CooldownSeconds=120} }
+    if (-not $cfg.AutoRotationEnabled) {
+        Write-RotatorLog 'Auto-rotation is paused by user.'
+        return
+    }
+    $threshold = [double]$cfg.MinQuotaPercent / 100.0
+    $state = Read-RotationState
+    if ($state.Status -in @('Switching','NeedsAttention')) {
+        if (-not (Repair-RotationState)) {
+            Write-RotatorLog 'Rotation paused: previous switch requires verification.'
+            return
+        }
+        $state = Read-RotationState
+    }
+    if ($state.UpdatedAt -and ([datetime]::UtcNow - ([datetime]$state.UpdatedAt).ToUniversalTime()).TotalSeconds -lt $cfg.CooldownSeconds) { return }
+    try { $runtime=Get-RuntimeIdentity } catch { Write-RotatorLog (Get-RuntimeFailureMessage $_); return }
+    if (-not $runtime) {
+        $pauseClosed = if ($cfg.PSObject.Properties['PauseScanWhenIdeClosed']) { [bool]$cfg.PauseScanWhenIdeClosed } else { $true }
+        $cliEnabled = if ($cfg.PSObject.Properties['CliRotationEnabled']) { [bool]$cfg.CliRotationEnabled } else { $true }
+        if ($pauseClosed) {
+            if ($script:LastClosedIdeLogState -ne 'PausedClosed') {
+                Write-RotatorLog 'IDE is closed; background scan paused.'
+                $script:LastClosedIdeLogState = 'PausedClosed'
+            }
+            return
+        }
+        if (-not $cliEnabled) {
+            if ($script:LastClosedIdeLogState -ne 'CliDisabled') {
+                Write-RotatorLog 'IDE is closed; monitoring only.'
+                $script:LastClosedIdeLogState = 'CliDisabled'
+            }
+            return
+        }
+        $script:LastClosedIdeLogState = ''
+        Invoke-CliAutoRotationCheck -Config $cfg -Threshold $threshold
+        return
+    }
+    $script:LastClosedIdeLogState = ''
+    try{$selectedModel=Get-RuntimeSelectedModel $runtime.Runtimes[0]}catch{$selectedModel=''}
+    $accounts = @(Get-AllAccountsQuota -IncludeModels)
+    $current = $accounts | Where-Object { $_.Email -eq $runtime.Email } | Select-Object -First 1
+    if (-not $current -or -not $current.Success) { Write-RotatorLog 'Active quota unknown; no rotation.'; return }
+    $currentQuota = if ($selectedModel) { Get-SelectedModelQuota $current $selectedModel } else { [pscustomobject]@{Known=$false;Remaining=-1.0;Model=''} }
+    $g5Text = if ($current.Gemini5H -ge 0) { "$([math]::Round($current.Gemini5H*100,1))%" } else { 'N/A' }
+    $mText = if ($currentQuota.Known) { "$([math]::Round($currentQuota.Remaining*100,1))%" } else { 'N/A' }
+    Write-RotatorLog "Active [$($current.AccountName)]: Gemini5H=$g5Text, model=$mText (threshold=$($cfg.MinQuotaPercent)%)."
+    $low5h = ($current.Gemini5H -ge 0 -and $current.Gemini5H -lt $threshold)
+    $lowModel = ($currentQuota.Known -and $currentQuota.Remaining -lt $threshold)
+    if (-not ($low5h -or $lowModel)) { return }
+    if (-not $runtime.Idle) { Write-RotatorLog 'Low quota; waiting for running agents to finish.'; return }
+    $best = $null
+    $useExpectedModel = ''
+    if ($selectedModel) {
+        $best = $accounts | Where-Object { $_.Email -ne $runtime.Email -and $_.Success -and $_.Gemini5H -gt $threshold } | ForEach-Object {
+            $candidateQuota = Get-SelectedModelQuota $_ $selectedModel
+            if ($candidateQuota.Known -and $candidateQuota.Remaining -gt $threshold) {
+                [pscustomobject]@{ AccountName = $_.AccountName; Remaining = [math]::Min($candidateQuota.Remaining, $_.Gemini5H) }
+            }
+        } | Sort-Object @{Expression='Remaining';Descending=$true}, AccountName | Select-Object -First 1
+        if ($best) { $useExpectedModel = $selectedModel }
+    }
+    if (-not $best -and $low5h) {
+        $best = $accounts | Where-Object { $_.Email -ne $runtime.Email -and $_.Success -and $_.Gemini5H -gt $threshold } | ForEach-Object {
+            [pscustomobject]@{ AccountName = $_.AccountName; Remaining = $_.Gemini5H }
+        } | Sort-Object @{Expression='Remaining';Descending=$true}, AccountName | Select-Object -First 1
+    }
+    if (-not $best) { Write-RotatorLog 'No healthy account available; waiting for quota reset.'; return }
+    $reason = if ($low5h) { "Gemini 5h quota below $($cfg.MinQuotaPercent) percent" } else { "Selected model below $($cfg.MinQuotaPercent) percent" }
+    Switch-ActiveAccount $best.AccountName -Reason $reason -ExpectedModel $useExpectedModel -ExpectedEmail $runtime.Email -Notify | Out-Null
+}
+
+function Repair-RotationState {
+    # Read-only identity comparison; never restart or write login credentials here.
+    $mutex=[Threading.Mutex]::new($false, 'Local\AntigravityAutoHub.Switch')
+    $locked=$false
+    try {
+        try { $locked=$mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked=$true }
+        if (-not $locked) { return $false }
+        $state=Read-RotationState
+        if ($state.Status -notin @('Switching','NeedsAttention','Prepared')) { return $true }
+        $runtime=Get-RuntimeIdentity
+        if (-not $runtime) { return $false }
+        $hasNoCsrf = @($runtime.Runtimes | Where-Object { $_ -and $_.PSObject.Properties['NoCsrfBridge'] -and $_.NoCsrfBridge }).Count -gt 0
+        if ($hasNoCsrf) {
+            # In NoCsrfBridge mode, runtime email is read from WinCred. Require proof that
+            # the running language_server.exe actually started after the state timestamp.
+            if (-not $state -or -not $state.UpdatedAt) { return $false }
+            $stateTime = ([datetime]$state.UpdatedAt).ToUniversalTime()
+            foreach ($rt in $runtime.Runtimes) {
+                if (-not $rt.ProcessId -or $rt.ProcessId -le 0 -or -not $rt.CreationDate) { return $false }
+                if (([datetime]$rt.CreationDate).ToUniversalTime() -le $stateTime) { return $false }
+            }
+        }
+        $storedRaw=Get-StoredCredential
+        if (-not $storedRaw) { return $false }
+        $stored=$storedRaw | ConvertFrom-Json
+        $user = $null
+        for ($authAttempt = 0; $authAttempt -lt 2; $authAttempt++) {
+            try {
+                $token=Invoke-GetFreshTokenSafe $stored -ForceRefresh:($authAttempt -gt 0)
+                $user=Invoke-RestMethod 'https://www.googleapis.com/oauth2/v3/userinfo' -Headers @{Authorization="Bearer $($token.token.access_token)"} -TimeoutSec 10 -ErrorAction Stop
+                break
+            } catch {
+                if ($authAttempt -eq 0 -and (Test-HttpUnauthorizedError $_)) {
+                    $rt = Get-RefreshToken $stored
+                    if ($rt) { Clear-AccessTokenCache $rt }
+                    continue
+                }
+                throw
+            }
+        }
+        if (-not $user -or $user.email -ne $runtime.Email) { return $false }
+        $matchedFile=$null
+        foreach ($file in (Get-ChildItem -LiteralPath $accDir -Filter '*.json')) {
+            try {
+                $saved=Read-AccountFile $file.FullName
+                if ((Get-RefreshToken $saved) -eq (Get-RefreshToken $stored)) {
+                    $matchedFile=$file
+                    break
+                }
+            } catch { }
+        }
+        if (-not $matchedFile) {
+            foreach ($file in (Get-ChildItem -LiteralPath $accDir -Filter '*.json')) {
+                try {
+                    $savedEmail=Get-CredentialEmail (Read-AccountFile $file.FullName -AsRawJson)
+                    if ($savedEmail -eq $runtime.Email) {
+                        $matchedFile=$file
+                        Save-AccountFile $file.FullName $stored
+                        break
+                    }
+                } catch { }
+            }
+        }
+        if ($matchedFile) {
+            $updatedAt=if ($state -and $state.UpdatedAt) { [string]$state.UpdatedAt } else { [datetime]::UtcNow.AddMinutes(-3).ToString('o') }
+            Set-RotationState 'Verified' $matchedFile.BaseName $runtime.Email $updatedAt
+            Write-AtomicText $activeFile $matchedFile.BaseName
+            return $true
+        }
+        return $false
+    } catch { return $false }
+    finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+}
